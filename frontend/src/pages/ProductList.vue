@@ -28,7 +28,7 @@
             <i class="fas fa-list me-2" style="color:var(--accent-light)" />
             Product List
             <span style="font-size:.75rem; font-weight:500; color:var(--text-muted); margin-left:8px">
-              ({{ filtered.length }})
+              ({{ meta.total ?? 0 }})
             </span>
           </div>
 
@@ -41,14 +41,21 @@
                 type="text"
                 class="custom-input search-input"
                 placeholder="Nombre o SKU..."
-                @input="currentPage = 1"
               />
             </div>
 
             <!-- Category filter -->
-            <select v-model="selectedCat" class="custom-select" @change="currentPage = 1">
+            <select v-model="selectedCatId" class="custom-select">
               <option value="">Todas las categorías</option>
-              <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
+              <template v-if="loadingCats">
+                <option disabled>Cargando...</option>
+              </template>
+              <option
+                v-else
+                v-for="cat in categories"
+                :key="cat.id"
+                :value="cat.id"
+              >{{ cat.name }}</option>
             </select>
 
             <!-- New product -->
@@ -72,7 +79,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="p in paginated" :key="p.id">
+              <tr v-for="p in products" :key="p.id">
                 <td><span class="product-name">{{ p.name }}</span></td>
                 <td><span class="sku-badge">{{ p.sku }}</span></td>
                 <td><span class="price-val">${{ formatPrice(p.price) }}</span></td>
@@ -82,7 +89,9 @@
                   </span>
                 </td>
                 <td>
-                  <span class="category-badge" :class="`cat-${p.category}`">{{ p.category?.name }}</span>
+                  <span class="category-badge" :class="`cat-${categoryName(p.category_id)}`">
+                    {{ categoryName(p.category_id) }}
+                  </span>
                 </td>
                 <td style="text-align:right">
                   <div class="d-flex gap-1 justify-content-end">
@@ -103,17 +112,17 @@
           </table>
 
           <!-- Empty state -->
-          <div v-if="!loading && filtered.length === 0" class="empty-state">
+          <div v-if="!loading && products.length === 0" class="empty-state">
             <div class="empty-icon"><i class="fas fa-box-open" /></div>
             <p>No se encontraron productos con los filtros aplicados.</p>
           </div>
         </div>
 
         <!-- Pagination -->
-        <div v-if="filtered.length > 0" class="pagination-wrap">
+        <div v-if="meta.total > 0" class="pagination-wrap">
           <div class="page-info">
-            Mostrando <strong>{{ fromItem }}–{{ toItem }}</strong>
-            de <strong>{{ filtered.length }}</strong> productos
+            Mostrando <strong>{{ meta.from }}–{{ meta.to }}</strong>
+            de <strong>{{ meta.total }}</strong> productos
           </div>
           <div class="d-flex align-items-center gap-2">
             <div class="page-nums">
@@ -122,13 +131,13 @@
                 :key="pg"
                 class="page-num-btn"
                 :class="{ active: pg === currentPage }"
-                @click="currentPage = pg"
+                @click="goToPage(pg)"
               >{{ pg }}</button>
             </div>
-            <button class="btn-ghost" :disabled="currentPage <= 1" @click="currentPage--">
+            <button class="btn-ghost" :disabled="currentPage <= 1" @click="goToPage(currentPage - 1)">
               <i class="fas fa-chevron-left" /> Anterior
             </button>
-            <button class="btn-ghost" :disabled="currentPage >= totalPages" @click="currentPage++">
+            <button class="btn-ghost" :disabled="currentPage >= meta.last_page" @click="goToPage(currentPage + 1)">
               Siguiente <i class="fas fa-chevron-right" />
             </button>
           </div>
@@ -149,54 +158,108 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import { useProducts, CATEGORIES } from '@/composables/useProducts.js'
+import { ref, computed, watch, onMounted } from 'vue'
+import { useProducts } from '@/composables/useProducts.js'
+import { useCategories } from '@/composables/useCategories.js'
 import { useToast } from '@/composables/useToast.js'
 import DeleteModal from '@/components/DeleteModal.vue'
-import { useCategories } from '@/composables/useCategories.js'
 
-const { products, fetchAll, remove } = useProducts()
-const { success, error: toastError } = useToast()
+const { fetchAll, remove } = useProducts()
 const { categories, fetchCategories } = useCategories()
+const { success, error: toastError } = useToast()
 
-// State
+// ── State ──────────────────────────────────────────────────────────
+const products    = ref([])
+const meta        = ref({ total: 0, from: 0, to: 0, last_page: 1 })
 const loading     = ref(false)
+const loadingCats = ref(false)
 const searchQuery = ref('')
-const selectedCat = ref('')
+const selectedCatId = ref('')
 const currentPage = ref(1)
 const PAGE_SIZE   = 10
-const showDelete  = ref(false)
-const toDelete    = ref(null)
-const deleting    = ref(false)
 
-// Load
-onMounted(async () => {
+const showDelete = ref(false)
+const toDelete   = ref(null)
+const deleting   = ref(false)
+
+// ── Debounce search ────────────────────────────────────────────────
+let searchTimer = null
+watch(searchQuery, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    currentPage.value = 1
+    loadProducts()
+  }, 400)
+})
+
+// Cambio de categoría: resetea página y recarga inmediatamente
+watch(selectedCatId, () => {
+  currentPage.value = 1
+  loadProducts()
+})
+
+// ── Load products ──────────────────────────────────────────────────
+const loadProducts = async () => {
   loading.value = true
   try {
-    await fetchAll()
+    const params = {}
+    if (searchQuery.value.trim())  params.search      = searchQuery.value.trim()
+    if (selectedCatId.value)       params.category_id = selectedCatId.value
+
+    // El backend devuelve un arreglo simple filtrado; paginamos en el frontend.
+    const all = await fetchAll(params)
+
+    const total    = all.length
+    const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+    if (currentPage.value > lastPage) {
+      currentPage.value = lastPage
+    }
+
+    const start = (currentPage.value - 1) * PAGE_SIZE
+    const end   = start + PAGE_SIZE
+
+    products.value = all.slice(start, end)
+    meta.value = {
+      total,
+      from: total === 0 ? 0 : start + 1,
+      to:   Math.min(end, total),
+      last_page: lastPage,
+    }
   } catch (e) {
     toastError('Error loading products', e.message ?? 'No se pudo conectar con el servidor.')
   } finally {
     loading.value = false
   }
+}
+
+// ── Load categories (para el select y los badges) ──────────────────
+const loadCats = async () => {
+  loadingCats.value = true
+  try {
+    await fetchCategories()
+  } catch {
+    toastError('Error al cargar categorías', 'No se pudieron obtener las categorías.')
+  } finally {
+    loadingCats.value = false
+  }
+}
+
+onMounted(() => {
+  loadCats()
+  loadProducts()
 })
 
-// Filters & pagination
-const filtered = computed(() => {
-  const q = searchQuery.value.trim().toLowerCase()
-  return products.value.filter(p => {
-    const matchQ   = !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q)
-    const matchCat = !selectedCat.value || p.category === selectedCat.value
-    return matchQ && matchCat
-  })
-})
+// ── Helpers ────────────────────────────────────────────────────────
+const formatPrice  = v => Number(v).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+const stockClass   = s => s > 10 ? 'stock-ok' : s > 0 ? 'stock-low' : 'stock-none'
 
-const totalPages   = computed(() => Math.ceil(filtered.value.length / PAGE_SIZE))
-const paginated    = computed(() => filtered.value.slice((currentPage.value - 1) * PAGE_SIZE, currentPage.value * PAGE_SIZE))
-const fromItem     = computed(() => filtered.value.length ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0)
-const toItem       = computed(() => Math.min(currentPage.value * PAGE_SIZE, filtered.value.length))
+// Resuelve el nombre de categoría a partir de su id
+const categoryName = (id) => categories.value.find(c => c.id === id)?.name ?? '—'
+
+// ── Pagination ─────────────────────────────────────────────────────
 const visiblePages = computed(() => {
-  const total = totalPages.value
+  const total = meta.value.last_page
   const cur   = currentPage.value
   let s = Math.max(1, cur - 2)
   let e = Math.min(total, s + 4)
@@ -204,21 +267,27 @@ const visiblePages = computed(() => {
   return Array.from({ length: e - s + 1 }, (_, i) => s + i)
 })
 
-// Helpers
-const formatPrice = v => Number(v).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-const stockClass  = s => s > 10 ? 'stock-ok' : s > 0 ? 'stock-low' : 'stock-none'
+const goToPage = (page) => {
+  currentPage.value = page
+  loadProducts()
+}
 
-// Delete
+// ── Delete ─────────────────────────────────────────────────────────
 const openDelete = (p) => { toDelete.value = p; showDelete.value = true }
+
 const confirmDelete = async () => {
   if (!toDelete.value) return
   deleting.value = true
   try {
     await remove(toDelete.value.id)
-    if (paginated.value.length === 0 && currentPage.value > 1) currentPage.value--
     success('Producto eliminado', `"${toDelete.value.name}" fue eliminado.`)
     showDelete.value = false
     toDelete.value   = null
+    // Si era el último de la página, retrocede una
+    if (products.value.length === 1 && currentPage.value > 1) {
+      currentPage.value--
+    }
+    loadProducts()
   } catch (e) {
     toastError('Error al eliminar', e.message)
   } finally {

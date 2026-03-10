@@ -10,9 +10,10 @@ export function useProducts() {
   /**
    * GET /api/products
    * Obtiene todos los productos desde el servidor.
+   * Acepta filtros opcionales vía query params (search, category_id, etc.).
    */
-  const fetchAll = async () => {
-    const { data } = await api.get('/products')
+  const fetchAll = async (params = {}) => {
+    const { data } = await api.get('/products', { params })
     products.value = data
     return data
   }
